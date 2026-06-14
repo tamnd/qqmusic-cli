@@ -8,7 +8,7 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/fang"
-	"github.com/tamnd/qqmusic-cli-cli/cli"
+	"github.com/tamnd/qqmusic-cli/cli"
 )
 
 func main() {

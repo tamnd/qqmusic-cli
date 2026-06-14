@@ -1,5 +1,5 @@
 title       = "qqmusic"
-baseURL     = "https://qqmusic-cli-cli.tamnd.com/"
+baseURL     = "https://qqmusic-cli.tamnd.com/"
 description = "Browse QQ Music charts and songs (QQ音乐)"
 contentDir  = "content"
 outputDir   = "public"
@@ -7,4 +7,4 @@ theme       = "tago-doks"
 syntaxHighlight = "true"
 
 [params]
-github = "https://github.com/tamnd/qqmusic-cli-cli"
+github = "https://github.com/tamnd/qqmusic-cli"
