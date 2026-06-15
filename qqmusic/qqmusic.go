@@ -1,13 +1,15 @@
-// Package qqmusic is the library behind the qqmusic command: the HTTP client,
-// request shaping, and the typed data models for QQ Music (QQ音乐).
+// Package qqmusic is the library behind the qqmusic command: HTTP client,
+// request shaping, and typed data models for QQ Music (QQ音乐).
 //
-// The client fetches chart data from the public QQ Music toplist endpoint at
-// https://c.y.qq.com. No authentication is required. It sets a real
-// User-Agent and Referer, paces requests, and retries transient 429/5xx
-// errors with exponential backoff.
+// All metadata endpoints work without authentication. The Referer and
+// User-Agent headers are required; the g_tk parameter is always 5381 for
+// anonymous access.
+//
+// qqmusic-cli is not affiliated with Tencent or QQ Music.
 package qqmusic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,94 +19,84 @@ import (
 	"time"
 )
 
-// charts maps chart name to topid parameter.
-var charts = map[string]int{
-	"hot":    4,  // 热歌榜
-	"new":    26, // 新歌榜
-	"rising": 27, // 飙升榜
-}
+const (
+	defaultBaseURL   = "https://c.y.qq.com"
+	defaultMusicuURL = "https://u.y.qq.com/cgi-bin/musicu.fcg"
+	defaultUA        = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	anonGTK          = "5381"
+)
 
-// ChartLabels maps chart name to its Chinese label.
-var ChartLabels = map[string]string{
-	"hot":    "热歌榜",
-	"new":    "新歌榜",
-	"rising": "飙升榜",
-}
-
-// Config holds constructor parameters for the Client.
+// Config holds constructor parameters for Client.
 type Config struct {
 	BaseURL   string
+	MusicuURL string // POST endpoint for musicu.fcg (artist songs)
 	UserAgent string
 	Rate      time.Duration
 	Retries   int
 	Timeout   time.Duration
 }
 
-// DefaultConfig returns sensible defaults.
-func DefaultConfig() Config {
-	return Config{
-		BaseURL:   "https://c.y.qq.com",
-		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		Rate:      500 * time.Millisecond,
-		Retries:   3,
-		Timeout:   30 * time.Second,
-	}
-}
-
-// Client talks to the QQ Music toplist API.
+// Client fetches data from the QQ Music public API.
 type Client struct {
-	cfg        Config
-	httpClient *http.Client
-	mu         sync.Mutex
-	last       time.Time
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
 }
 
-// NewClient returns a Client with the given config.
+// NewClient returns a Client configured with cfg.
 func NewClient(cfg Config) *Client {
 	return &Client{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// Top fetches the chart specified by chart ("hot", "new", or "rising") and
-// returns up to limit songs in ranked order.
-func (c *Client) Top(ctx context.Context, chart string, limit int) ([]Song, error) {
-	topid, ok := charts[chart]
-	if !ok {
-		return nil, fmt.Errorf("unknown chart %q", chart)
-	}
-
-	url := fmt.Sprintf(
-		"%s/v8/fcg-bin/fcg_v8_toplist_opt.fcg?tpl=3&page=detail&type=top&topid=%d&needNewCode=1&uin=0&format=json&inCharset=utf-8&outCharset=utf-8&notice=0&platform=h5",
-		c.cfg.BaseURL, topid,
-	)
-
-	raw, err := c.get(ctx, url)
+func (c *Client) getJSON(ctx context.Context, u string, dst any) error {
+	b, err := c.get(ctx, u)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	var resp wireResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, fmt.Errorf("decode toplist: %w", err)
+	if err := json.Unmarshal(b, dst); err != nil {
+		return fmt.Errorf("decode: %w", err)
 	}
-
-	entries := resp.SongList
-	if limit > 0 && len(entries) > limit {
-		entries = entries[:limit]
-	}
-
-	out := make([]Song, 0, len(entries))
-	for i, e := range entries {
-		out = append(out, wireToSong(e, i+1))
-	}
-	return out, nil
+	return nil
 }
 
-// get performs an HTTP GET with the Referer and User-Agent headers set,
-// retrying on transient failures.
-func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
+func (c *Client) postJSON(ctx context.Context, u string, body any, dst any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	c.pace()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Referer", "https://y.qq.com/")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(b, dst); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
@@ -114,7 +106,7 @@ func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		b, retry, err := c.do(ctx, url)
+		b, retry, err := c.do(ctx, u)
 		if err == nil {
 			return b, nil
 		}
@@ -123,19 +115,19 @@ func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", u, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) ([]byte, bool, error) {
+func (c *Client) do(ctx context.Context, u string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.cfg.UserAgent)
 	req.Header.Set("Referer", "https://y.qq.com/")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -143,6 +135,9 @@ func (c *Client) do(ctx context.Context, url string) ([]byte, bool, error) {
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, ErrNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
